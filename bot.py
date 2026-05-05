@@ -26,7 +26,8 @@ from PIL import Image
 import piexif
 from flask import Flask
 import threading
-
+from pillow_heif import register_heif_opener
+register_heif_opener()
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
