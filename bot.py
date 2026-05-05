@@ -1,30 +1,23 @@
 import os
 import io
-import json
-import signal
 import logging
-import datetime
-import cv2
-import numpy as np
+import signal
+import threading
+import re
+from flask import Flask
 from PIL import Image
 import piexif
-from flask import Flask
-import threading
 from pillow_heif import register_heif_opener
-import re
-
-# Register HEIF opener for iPhone photo support
-register_heif_opener()
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
+
+register_heif_opener()
 
 # ── Logging & Web Server ──────────────────────────────────────────────────
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", level=logging.INFO)
@@ -34,22 +27,30 @@ app = Flask(__name__)
 
 @app.route('/')
 @app.route('/health')
-def health():
-    return "OK", 200
+def health(): return "OK", 200
 
-def run_web():
-    # Flask must run on 0.0.0.0 for Koyeb health checks
-    app.run(host='0.0.0.0', port=8000, use_reloader=False)
+def run_web(): app.run(host='0.0.0.0', port=8000, use_reloader=False)
 
 # ── Configuration ──────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-# Absolute path for Koyeb persistent volumes
-DATA_FILE = "/app/data.json"
 
 def escape_markdown(text):
-    """Escapes characters that break Telegram's Markdown parser."""
     if not text: return ""
     return str(text).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+
+# ── GPS Conversion Logic ──────────────────────────────────────────────────
+def to_decimal(coords, ref):
+    """Converts GPS rational tuples to decimal degrees."""
+    try:
+        deg = coords[0][0] / coords[0][1]
+        mnt = coords[1][0] / coords[1][1]
+        sec = coords[2][0] / coords[2][1]
+        decimal = deg + (mnt / 60.0) + (sec / 3600.0)
+        if ref in ['S', 'W']:
+            decimal = -decimal
+        return decimal
+    except:
+        return None
 
 # ── Image Processing ───────────────────────────────────────────────────────
 def extract_metadata(image_bytes: bytes) -> dict:
@@ -60,49 +61,66 @@ def extract_metadata(image_bytes: bytes) -> dict:
                 "Format": img.format or "Unknown",
                 "Dimensions": f"{img.width}x{img.height}",
                 "Mode": img.mode
-            }
+            },
+            "Location": {}
         }
         
-        try:
-            exif_data = piexif.load(image_bytes)
-            exif_sec = {}
-            for ifd in ("0th", "Exif", "GPS"):
-                for tag_id, value in exif_data.get(ifd, {}).items():
-                    tag_name = piexif.TAGS.get(ifd, {}).get(tag_id, {}).get("name", f"Tag_{tag_id}")
-                    if isinstance(value, bytes):
-                        value = value.decode("utf-8", errors="replace").strip("\x00")
-                    if value not in ("", b""):
-                        exif_sec[tag_name] = str(value)
-            if exif_sec:
-                meta["EXIF Data"] = exif_sec
-        except:
-            pass
+        exif_data = piexif.load(image_bytes)
+        
+        # Parse GPS specifically
+        gps = exif_data.get("GPS", {})
+        if gps:
+            lat = to_decimal(gps.get(piexif.GPSIFD.GPSLatitude), gps.get(piexif.GPSIFD.GPSLatitudeRef))
+            lon = to_decimal(gps.get(piexif.GPSIFD.GPSLongitude), gps.get(piexif.GPSIFD.GPSLongitudeRef))
+            if lat is not None and lon is not None:
+                meta["Location"]["Coordinates"] = f"{lat:.6f}, {lon:.6f}"
+                meta["Location"]["Google Maps"] = f"https://www.google.com/maps?q={lat},{lon}"
+
+        # Parse General EXIF
+        exif_sec = {}
+        for ifd in ("0th", "Exif"):
+            for tag_id, value in exif_data.get(ifd, {}).items():
+                tag_name = piexif.TAGS.get(ifd, {}).get(tag_id, {}).get("name", f"Tag_{tag_id}")
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace").strip("\x00")
+                if value not in ("", b"") and "Tag_" not in tag_name:
+                    exif_sec[tag_name] = str(value)
+        
+        if exif_sec: meta["EXIF Data"] = exif_sec
         return meta
     except Exception as e:
         return {"Error": {"Detail": str(e)}}
 
 def format_report(meta: dict) -> str:
     lines = ["📸 *Photo Metadata Report*\n"]
+    
+    # Prioritize Location at the top if it exists
+    if meta.get("Location"):
+        lines.append("*📍 Location*")
+        for k, v in meta["Location"].items():
+            lines.append(f"• {k}: {v}")
+        lines.append("")
+
     for section, fields in meta.items():
+        if section in ["Location", "Error"] or not fields: continue
         lines.append(f"*{section}*")
         for k, v in fields.items():
             lines.append(f"• `{escape_markdown(k)}`: {escape_markdown(v)}")
         lines.append("")
+        
+    if "Error" in meta:
+        lines.append("❌ *Errors*: " + str(meta["Error"]))
+        
     return "\n".join(lines)
 
 # ── Handlers ───────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *Welcome to MetaSnap*\n\nSend any photo **as a file** (uncompressed) to see its hidden metadata.",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("👋 Send a photo **as a file** to see metadata and map location.", parse_mode="Markdown")
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Detect if it's a photo or a document
     is_doc = bool(update.message.document)
     file_obj = update.message.document if is_doc else update.message.photo[-1]
-    
-    msg = await update.message.reply_text("🔍 Processing image...")
+    msg = await update.message.reply_text("🔍 Extracting metadata...")
     
     try:
         tg_file = await context.bot.get_file(file_obj.file_id)
@@ -112,42 +130,24 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = format_report(metadata)
         
         if not is_doc:
-            report += "\n⚠️ _Note: This was sent as a photo. Metadata may be stripped by Telegram. Send as a **File** for full EXIF data._"
+            report += "\n⚠️ _Note: Sent as compressed photo. Location data may be missing. Send as File for best results._"
             
         await msg.delete()
-        await update.message.reply_text(report, parse_mode="Markdown")
+        await update.message.reply_text(report, parse_mode="Markdown", disable_web_page_preview=False)
         
     except Exception as e:
-        logger.error(f"Processing error: {e}")
-        await msg.edit_text("❌ An error occurred while parsing this file. Ensure it is a valid image format.")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+        logger.error(f"Error: {e}")
+        await msg.edit_text("❌ Failed to parse file.")
 
 # ── Main ───────────────────────────────────────────────────────────────────
 def main():
-    if not BOT_TOKEN:
-        print("Error: BOT_TOKEN not found in environment variables.")
-        return
-
-    # Start Flask thread for health checks
     threading.Thread(target=run_web, daemon=True).start()
-
-    # Build Application
     application = Application.builder().token(BOT_TOKEN).build()
-
-    # Add Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE | filters.Document.ALL, handle_image))
-    application.add_error_handler(error_handler)
-
-    print("🤖 MetaSnap Bot is starting...")
     
-    # drop_pending_updates=True is critical to fix the loop you saw in logs
-    application.run_polling(
-        drop_pending_updates=True, 
-        stop_signals=[signal.SIGINT, signal.SIGTERM]
-    )
+    logger.info("🤖 Bot is starting...")
+    application.run_polling(drop_pending_updates=True, stop_signals=[signal.SIGINT, signal.SIGTERM])
 
 if __name__ == "__main__":
     main()
