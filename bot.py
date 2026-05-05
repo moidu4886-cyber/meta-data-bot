@@ -24,6 +24,8 @@ import logging
 import datetime
 from PIL import Image
 import piexif
+from flask import Flask
+import threading
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -42,6 +44,14 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_web():
+    app.run(host='0.0.0.0', port=8000)
 
 # ── Config from environment ───────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -874,6 +884,7 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info("🤖 MetaSnap Bot started. Polling…")
+    threading.Thread(target=run_web).start() 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,                        # ignore queued msgs on restart
