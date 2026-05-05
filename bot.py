@@ -1,19 +1,5 @@
 """
-MetaSnap Bot — Full Edition
-Features:
-  • Photo metadata extraction (EXIF, GPS, ICC, DPI, etc.)
-  • Metadata stripping + before/after size comparison
-  • EXIF field editor (Author, Copyright, Description, Software, DateTime, Comment)
-  • Resize image to custom dimensions
-  • Convert format (JPEG ↔ PNG ↔ WEBP)
-  • User scan history (last 5 scans per user)
-  • /poll — create Telegram polls in-chat
-  • /feedback — users send feedback to admin
-  • Admin: /stats /users /ban /unban /broadcast /adminhelp
-  • Auto-notify admin on new user
-  • Graceful shutdown on SIGINT / SIGTERM
-  • Ban guard on all user commands
-  • Persistent JSON datastore (data.json)
+MetaSnap Bot — Full Edition (With Image Authenticity Analyzer)
 """
 
 import os
@@ -22,6 +8,8 @@ import json
 import signal
 import logging
 import datetime
+import cv2
+import numpy as np
 from PIL import Image
 import piexif
 from flask import Flask
@@ -52,7 +40,7 @@ def home():
     return "Bot is running!"
 
 def run_web():
-    app.run(host='0.0.0.0', port=8000)
+    app.run(host='0.0.0.0', port=8000, use_reloader=False)
 
 # ── Config from environment ───────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -149,7 +137,11 @@ def bytes_to_human(size: int) -> str:
     return f"{size:.1f} TB"
 
 def extract_metadata(image_bytes: bytes) -> dict:
-    img  = Image.open(io.BytesIO(image_bytes))
+    try:
+        img  = Image.open(io.BytesIO(image_bytes))
+    except Exception:
+        return {"Basic Info": {"Error": "Could not open image file."}}
+
     meta = {
         "Basic Info": {
             "Format":     img.format or "Unknown",
@@ -250,6 +242,7 @@ def edit_exif_field(raw: bytes, field: str, value: str) -> bytes:
         exif_dict = piexif.load(raw)
     except Exception:
         exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+    
     field_map = {
         "author":      (piexif.ImageIFD.Artist,           "0th"),
         "copyright":   (piexif.ImageIFD.Copyright,        "0th"),
@@ -258,15 +251,100 @@ def edit_exif_field(raw: bytes, field: str, value: str) -> bytes:
         "datetime":    (piexif.ImageIFD.DateTime,         "0th"),
         "comment":     (piexif.ExifIFD.UserComment,       "Exif"),
     }
+    
     tag_id, ifd = field_map.get(field.lower(), (None, None))
     if tag_id and ifd:
         exif_dict.setdefault(ifd, {})[tag_id] = value.encode()
-    exif_bytes = piexif.dump(exif_dict)
+        
+    try:
+        exif_bytes = piexif.dump(exif_dict)
+    except Exception:
+        exif_bytes = b""
+        
     out = io.BytesIO()
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
-    img.save(out, format="JPEG", exif=exif_bytes)
+    
+    if exif_bytes:
+        img.save(out, format="JPEG", exif=exif_bytes)
+    else:
+        img.save(out, format="JPEG")
+        
     return out.getvalue()
+
+# ── Image Authenticity Logic ──────────────────────────────────────────────────
+def analyze_authenticity(image_bytes: bytes) -> dict:
+    risk_score = 0
+    reasons = []
+
+    # 1. Basic Integrity Check
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.verify() 
+    except Exception:
+        return {"score": 100, "verdict": "🔴 Likely Edited (Corrupted)", "reasons": ["Image decoding failed or file is corrupted."]}
+
+    # 2. EXIF Metadata & Software Tag Check
+    has_exif = False
+    software_used = None
+    try:
+        exif_data = piexif.load(image_bytes)
+        if any(exif_data.values()):
+            has_exif = True
+            software_bytes = exif_data.get("0th", {}).get(piexif.ImageIFD.Software, b"")
+            if software_bytes:
+                software_used = software_bytes.decode("utf-8", errors="ignore").strip()
+        else:
+            risk_score += 25
+            reasons.append("No EXIF metadata (metadata wiped or natively lacks it)")
+    except Exception:
+        risk_score += 35
+        reasons.append("EXIF metadata is corrupted or unreadable")
+
+    if software_used:
+        known_editors = ["photoshop", "snapseed", "picsart", "canva", "lightroom", "gimp", "illustrator", "pixelmator", "affinity"]
+        sw_lower = software_used.lower()
+        if any(editor in sw_lower for editor in known_editors):
+            risk_score += 65
+            reasons.append(f"Edited using known software: {software_used}")
+        else:
+            reasons.append(f"Contains Software tag: {software_used}")
+
+    # 3. Compression / Quality Analysis (Laplacian Variance)
+    try:
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        cv_img = cv2.imdecode(np_arr, cv2.IMREAD_GRAYSCALE)
+        if cv_img is not None:
+            variance = cv2.Laplacian(cv_img, cv2.CV_64F).var()
+            # Images with var < 80 tend to lack sharp high-frequency edges, often indicating recompression or blurring
+            if variance < 80:
+                risk_score += 20
+                reasons.append(f"Low edge detail (variance {variance:.1f}) — possible recompression/blurring")
+        else:
+            risk_score += 10
+            reasons.append("Could not run deep pixel analysis")
+    except Exception:
+        risk_score += 5
+        reasons.append("Compression analysis skipped (OpenCV error)")
+
+    if not reasons:
+        reasons.append("No suspicious signs detected")
+
+    # Score capping and Verdict
+    risk_score = min(risk_score, 100)
+
+    if risk_score < 30:
+        verdict = "🟢 Likely Original"
+    elif risk_score < 60:
+        verdict = "🟡 Possibly Edited"
+    else:
+        verdict = "🔴 Likely Edited"
+
+    return {
+        "score": risk_score,
+        "verdict": verdict,
+        "reasons": reasons
+    }
 
 def metadata_summary(meta: dict) -> str:
     b   = meta.get("Basic Info", {})
@@ -286,6 +364,9 @@ def action_keyboard(file_id: str, fmt: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🔄 Convert Format",  callback_data=f"convertmenu:{file_id}:{fmt}"),
         ],
+        [
+            InlineKeyboardButton("🔍 Analyze Authenticity", callback_data=f"analyze:{file_id}:{fmt}"),
+        ]
     ])
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -331,6 +412,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "  Send any photo or image file → full metadata report\n"
         "  Send as 📎 file to keep GPS / camera model / EXIF intact\n\n"
         "*🛠 Action buttons (appear after every scan)*\n"
+        "  🔍 Analyze Authenticity — Risk-based score detecting manipulation\n"
         "  🗑 Strip Metadata — remove all EXIF and save clean copy\n"
         "  ✏️ Edit EXIF — change Author, Copyright, DateTime etc.\n"
         "  📊 Compare Size — before vs after strip report\n"
@@ -408,6 +490,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         parse_mode="Markdown",
         reply_markup=action_keyboard(doc.file_id, fmt),
     )
+
+# ── Analyze Authenticity Handler ──────────────────────────────────────────────
+async def cb_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    _, file_id, fmt = q.data.split(":", 2)
+    
+    msg = await q.message.reply_text("🔍 Analyzing authenticity & anomalies...")
+    
+    file = await context.bot.get_file(file_id)
+    raw  = bytes(await file.download_as_bytearray())
+    
+    report = analyze_authenticity(raw)
+    
+    formatted_reasons = "\n".join([f"  • {r}" for r in report["reasons"]])
+    
+    response = (
+        "🧠 *Authenticity Report*\n\n"
+        f"**Risk Score:** `{report['score']}%`\n"
+        f"**Verdict:** {report['verdict']}\n\n"
+        "**Reasons:**\n"
+        f"{formatted_reasons}"
+    )
+    
+    await msg.edit_text(response, parse_mode="Markdown")
 
 # ── Strip ─────────────────────────────────────────────────────────────────────
 async def cb_strip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -812,7 +919,7 @@ def main() -> None:
         per_message=False,
     )
 
-    # Resize conversation (triggered by inline button)
+    # Resize conversation
     resize_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(cb_resize_prompt, pattern=r"^resizeprompt:")],
         states={
@@ -843,7 +950,7 @@ def main() -> None:
         per_message=False,
     )
 
-    # Broadcast conversation (admin)
+    # Broadcast conversation
     broadcast_conv = ConversationHandler(
         entry_points=[CommandHandler("broadcast", broadcast_start)],
         states={
@@ -876,6 +983,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
 
     # Inline callbacks
+    app.add_handler(CallbackQueryHandler(cb_analyze,      pattern=r"^analyze:"))
     app.add_handler(CallbackQueryHandler(cb_strip,        pattern=r"^strip:"))
     app.add_handler(CallbackQueryHandler(cb_compare,      pattern=r"^compare:"))
     app.add_handler(CallbackQueryHandler(cb_convert_menu, pattern=r"^convertmenu:"))
@@ -885,11 +993,11 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     logger.info("🤖 MetaSnap Bot started. Polling…")
-    threading.Thread(target=run_web).start() 
+    threading.Thread(target=run_web, daemon=True).start() 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,                        # ignore queued msgs on restart
-        stop_signals=[signal.SIGINT, signal.SIGTERM],     # graceful shutdown
+        drop_pending_updates=True,
+        stop_signals=[signal.SIGINT, signal.SIGTERM],
     )
 
 if __name__ == "__main__":
